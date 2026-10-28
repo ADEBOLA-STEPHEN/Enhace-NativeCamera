@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Platform theme (no AppCompat dependency). Compose draws everything; this only
+        controls the window: pure black background, transparent bars, and edge-to-edge
+        rendering into the display cutout so the viewfinder is truly full-screen.
+    -->
+    <style name="Theme.MyNativeCamera" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/cine_black</item>
+        <item name="android:colorBackground">@color/cine_black</item>
+        <item name="android:colorPrimary">@color/navy_700</item>
+        <item name="android:colorPrimaryDark">@color/navy_900</item>
+        <item name="android:colorAccent">@color/navy_700</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+    </style>
+</resources>

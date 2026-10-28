@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ===== Hardware features ===== -->
+    <!-- Any camera (back or front) satisfies the requirement; the engine selects the best back lens. -->
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="true" />
+    <!-- Manual sensor control is preferred but probed at runtime (REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR). -->
+    <uses-feature
+        android:name="android.hardware.camera.capability.manual_sensor"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.level.full"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="true" />
+
+    <!-- ===== Runtime permissions ===== -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!--
+        No storage permission is required: minSdk is 29 and videos are written through
+        MediaStore (scoped storage) into DCIM/MyNativeCamera, which the app owns.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MyNativeCamera"
+        tools:targetApi="35">
+
+        <!--
+            sensorLandscape: cinema framing, and the TextureView/MediaRecorder orientation
+            math only has to handle ROTATION_90 / ROTATION_270.
+            configChanges: the camera session must not be torn down by Activity recreation.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:resizeableActivity="false"
+            android:windowSoftInputMode="adjustNothing"
+            android:theme="@style/Theme.MyNativeCamera"
+            tools:ignore="DiscouragedApi,LockedOrientationActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Allows launching from the system "video camera" shortcut -->
+            <intent-filter>
+                <action android:name="android.media.action.VIDEO_CAMERA" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

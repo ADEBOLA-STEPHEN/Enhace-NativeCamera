@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="cine_black">#FF000000</color>
+    <color name="navy_900">#FF0A2342</color>
+    <color name="navy_700">#FF1A365D</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
