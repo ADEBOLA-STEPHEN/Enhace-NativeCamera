@@ -9,7 +9,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Scalar
+import org.opencv.photo.Photo
+import java.util.ArrayList
 import kotlin.math.exp
 import kotlin.math.roundToInt
 
@@ -69,12 +76,24 @@ data class YuvFrameData(
 
 /**
  * Computational Image Processor:
- * Performs multi-frame computational photography by mathematically blending 3 bracketed exposures
- * (-2 EV highlight recovery, 0 EV base exposure, +2 EV shadow detail) using weighted exposure fusion.
+ * Performs multi-frame computational photography by optically aligning 3 bracketed exposures
+ * (-2 EV highlight recovery, 0 EV base exposure, +2 EV shadow detail) using OpenCV AlignMTB
+ * (Median Threshold Bitmap) and fusing them with Mertens exposure fusion to eliminate ghosting.
  */
 object ComputationalImageProcessor {
 
     private const val TAG = "ComputationalImageProc"
+
+    private val isOpencvReady: Boolean by lazy {
+        try {
+            val ok = OpenCVLoader.initLocal() || OpenCVLoader.initDebug()
+            Log.i(TAG, "OpenCV initialized in ComputationalImageProcessor: $ok")
+            ok
+        } catch (e: Throwable) {
+            Log.w(TAG, "OpenCV failed to initialize, will use fallback engine", e)
+            false
+        }
+    }
 
     // Precomputed Gaussian well-exposedness lookup table centered at 128 (8-bit midtone)
     // with sigma = 48.0f to prioritize balanced luminance and avoid clipped pixels.
@@ -84,6 +103,185 @@ object ComputationalImageProcessor {
     }
 
     data class AlignmentOffset(val dx: Int, val dy: Int)
+
+    /**
+     * Blends 3 bracketed YUV frames (-2 EV, 0 EV, +2 EV) into a single high dynamic range Bitmap.
+     * Keeps all image processing operations strictly on Dispatchers.Default off the main UI thread.
+     *
+     * Phase 2 Permanent Un-Mirroring:
+     * When isFrontCamera is true, applies a hardware Matrix flip (scaleX = -1f) permanently flipping pixels
+     * so that the saved image matches what the user saw in the viewfinder without relying on EXIF tags.
+     */
+    suspend fun blendHdrBurst(
+        frames: List<YuvFrameData>,
+        rotationDegrees: Int = 0,
+        mirrorHorizontal: Boolean = false,
+        isFrontCamera: Boolean = false,
+    ): Bitmap = withContext(Dispatchers.Default) {
+        require(frames.isNotEmpty()) { "Frames list cannot be empty" }
+        val sorted = frames.sortedBy { it.exposureBiasEv }
+
+        val fusedBitmap = if (frames.size == 1) {
+            yuvToBitmap(frames[0], rotationDegrees, mirrorHorizontal)
+        } else if (isOpencvReady) {
+            try {
+                blendWithOpenCv(sorted, rotationDegrees, mirrorHorizontal)
+            } catch (e: Throwable) {
+                Log.w(TAG, "OpenCV Mertens fusion error, falling back to CPU engine", e)
+                blendFallback(sorted, rotationDegrees, mirrorHorizontal)
+            }
+        } else {
+            blendFallback(sorted, rotationDegrees, mirrorHorizontal)
+        }
+
+        if (isFrontCamera) {
+            val flipMatrix = Matrix().apply { postScale(-1f, 1f) }
+            val flipped = Bitmap.createBitmap(fusedBitmap, 0, 0, fusedBitmap.width, fusedBitmap.height, flipMatrix, true)
+            if (flipped != fusedBitmap) {
+                fusedBitmap.recycle()
+            }
+            flipped
+        } else {
+            fusedBitmap
+        }
+    }
+
+    /**
+     * Permanent Un-Mirroring helper for still photos:
+     * If active camera is LENS_FACING_FRONT, applies a hardware Matrix flip:
+     * Matrix().apply { postScale(-1f, 1f) } and Bitmap.createBitmap(...) to permanently flip pixels horizontally.
+     */
+    fun applyFrontCameraUnMirror(original: Bitmap, isFrontCamera: Boolean): Bitmap {
+        if (!isFrontCamera) return original
+        val matrix = Matrix().apply { postScale(-1f, 1f) }
+        val flipped = Bitmap.createBitmap(original, 0, 0, original.width, original.height, matrix, true)
+        if (flipped != original) {
+            original.recycle()
+        }
+        return flipped
+    }
+
+    /**
+     * Optical Alignment (AlignMTB) and De-ghosting Exposure Fusion (MergeMertens) using OpenCV.
+     */
+    private fun blendWithOpenCv(
+        sorted: List<YuvFrameData>,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
+    ): Bitmap {
+        val fUnder = sorted.first()
+        val fNormal = if (sorted.size >= 3) sorted[1] else sorted.first()
+        val fOver = sorted.last()
+
+        val width = fNormal.width
+        val height = fNormal.height
+
+        // 1. Convert frames to OpenCV Mats (CV_8UC3 RGB)
+        val matUnder = yuvToRgbMat(fUnder)
+        val matNormal = yuvToRgbMat(fNormal) // 0 EV Anchor frame
+        val matOver = yuvToRgbMat(fOver)
+
+        val alignedUnder = Mat()
+        val alignedOver = Mat()
+        val fusedMat = Mat()
+        val ldrMat = Mat()
+
+        try {
+            // 2. Align -2 EV and +2 EV frames to the 0 EV Anchor frame using AlignMTB
+            val alignMTB = Photo.createAlignMTB(6, 4, false)
+            val shiftUnder = alignMTB.calculateShift(matNormal, matUnder)
+            val shiftOver = alignMTB.calculateShift(matNormal, matOver)
+
+            Log.i(TAG, "AlignMTB optical shift relative to 0 EV anchor: -2EV=(${shiftUnder.x}, ${shiftUnder.y}), +2EV=(${shiftOver.x}, ${shiftOver.y})")
+
+            alignMTB.shiftMat(matUnder, alignedUnder, shiftUnder)
+            alignMTB.shiftMat(matOver, alignedOver, shiftOver)
+
+            val alignedList = ArrayList<Mat>(3).apply {
+                add(alignedUnder)
+                add(matNormal) // 0 EV Anchor
+                add(alignedOver)
+            }
+
+            // 3. Exposure fusion & de-ghosting via MergeMertens
+            val mergeMertens = Photo.createMergeMertens(1.0f, 1.0f, 0.0f)
+            mergeMertens.process(alignedList, fusedMat)
+
+            // 4. MergeMertens produces 32-bit float [0..1]. Scale by 255.0 to 8-bit LDR
+            Core.multiply(fusedMat, Scalar(255.0, 255.0, 255.0), ldrMat)
+            ldrMat.convertTo(ldrMat, CvType.CV_8UC3)
+
+            val fusedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(ldrMat, fusedBitmap)
+
+            // 5. Apply orientation and mirror matrices
+            val matrix = Matrix()
+            if (mirrorHorizontal) {
+                matrix.postScale(-1f, 1f, width / 2f, height / 2f)
+            }
+            if (rotationDegrees % 360 != 0) {
+                matrix.postRotate(rotationDegrees.toFloat())
+            }
+
+            return if (!matrix.isIdentity) {
+                val transformed = Bitmap.createBitmap(fusedBitmap, 0, 0, width, height, matrix, true)
+                if (transformed != fusedBitmap) fusedBitmap.recycle()
+                transformed
+            } else {
+                fusedBitmap
+            }
+        } finally {
+            matUnder.release()
+            matNormal.release()
+            matOver.release()
+            alignedUnder.release()
+            alignedOver.release()
+            fusedMat.release()
+            ldrMat.release()
+        }
+    }
+
+    /**
+     * Converts YuvFrameData into a 3-channel 8-bit RGB OpenCV Mat (CvType.CV_8UC3).
+     */
+    private fun yuvToRgbMat(frame: YuvFrameData): Mat {
+        val width = frame.width
+        val height = frame.height
+        val mat = Mat(height, width, CvType.CV_8UC3)
+        val rgbBytes = ByteArray(width * height * 3)
+
+        val yPlane = frame.yPlane
+        val uPlane = frame.uPlane
+        val vPlane = frame.vPlane
+        val yStride = frame.yRowStride
+        val uStride = frame.uRowStride
+        val vStride = frame.vRowStride
+        val uPixelStride = frame.uPixelStride
+        val vPixelStride = frame.vPixelStride
+
+        var outIdx = 0
+        for (row in 0 until height) {
+            val yRowOffset = row * yStride
+            val uvRowOffset = (row shr 1) * uStride
+            val vRowOffset = (row shr 1) * vStride
+            for (col in 0 until width) {
+                val y = yPlane[yRowOffset + col].toInt() and 0xFF
+                val uvColOffset = (col shr 1)
+                val u = (uPlane[uvRowOffset + uvColOffset * uPixelStride].toInt() and 0xFF) - 128
+                val v = (vPlane[vRowOffset + uvColOffset * vPixelStride].toInt() and 0xFF) - 128
+
+                val r = (y + (1.402f * v)).roundToInt().coerceIn(0, 255).toByte()
+                val g = (y - (0.344136f * u) - (0.714136f * v)).roundToInt().coerceIn(0, 255).toByte()
+                val b = (y + (1.772f * u)).roundToInt().coerceIn(0, 255).toByte()
+
+                rgbBytes[outIdx++] = r
+                rgbBytes[outIdx++] = g
+                rgbBytes[outIdx++] = b
+            }
+        }
+        mat.put(0, 0, rgbBytes)
+        return mat
+    }
 
     private fun computeAlignment(
         base: YuvFrameData,
@@ -131,22 +329,11 @@ object ComputationalImageProcessor {
         return AlignmentOffset(bestDx, bestDy)
     }
 
-    /**
-     * Blends 3 bracketed YUV frames (-2 EV, 0 EV, +2 EV) into a single high dynamic range Bitmap.
-     * Parallelized across CPU cores using coroutines for maximum throughput.
-     */
-    suspend fun blendHdrBurst(
-        frames: List<YuvFrameData>,
-        rotationDegrees: Int = 0,
-        mirrorHorizontal: Boolean = false,
-    ): Bitmap = withContext(Dispatchers.Default) {
-        require(frames.isNotEmpty()) { "Frames list cannot be empty" }
-        if (frames.size == 1) {
-            return@withContext yuvToBitmap(frames[0], rotationDegrees, mirrorHorizontal)
-        }
-
-        // Sort frames by exposure bias: [Under (-2 EV), Normal (0 EV), Over (+2 EV)]
-        val sorted = frames.sortedBy { it.exposureBiasEv }
+    private suspend fun blendFallback(
+        sorted: List<YuvFrameData>,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
+    ): Bitmap = coroutineScope {
         val fUnder = sorted.first()
         val fNormal = if (sorted.size >= 3) sorted[1] else sorted.first()
         val fOver = sorted.last()
@@ -158,33 +345,30 @@ object ComputationalImageProcessor {
         val cpuCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
         val sliceHeight = (height + cpuCores - 1) / cpuCores
 
-        coroutineScope {
-            // Compute micro-alignment offsets to eliminate handshake ghosting
-            val alignUnder = async { computeAlignment(fNormal, fUnder) }
-            val alignOver = async { computeAlignment(fNormal, fOver) }
-            val offsetUnder = alignUnder.await()
-            val offsetOver = alignOver.await()
+        val alignUnder = async { computeAlignment(fNormal, fUnder) }
+        val alignOver = async { computeAlignment(fNormal, fOver) }
+        val offsetUnder = alignUnder.await()
+        val offsetOver = alignOver.await()
 
-            val jobs = (0 until cpuCores).map { sliceIdx ->
-                val startY = sliceIdx * sliceHeight
-                val endY = minOf(startY + sliceHeight, height)
-                async {
-                    processSlice(
-                        startY = startY,
-                        endY = endY,
-                        width = width,
-                        height = height,
-                        fUnder = fUnder,
-                        fNormal = fNormal,
-                        fOver = fOver,
-                        offsetUnder = offsetUnder,
-                        offsetOver = offsetOver,
-                        outPixels = outPixels,
-                    )
-                }
+        val jobs = (0 until cpuCores).map { sliceIdx ->
+            val startY = sliceIdx * sliceHeight
+            val endY = minOf(startY + sliceHeight, height)
+            async {
+                processSlice(
+                    startY = startY,
+                    endY = endY,
+                    width = width,
+                    height = height,
+                    fUnder = fUnder,
+                    fNormal = fNormal,
+                    fOver = fOver,
+                    offsetUnder = offsetUnder,
+                    offsetOver = offsetOver,
+                    outPixels = outPixels,
+                )
             }
-            jobs.awaitAll()
         }
+        jobs.awaitAll()
 
         val bitmap = Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
 
@@ -254,43 +438,33 @@ object ComputationalImageProcessor {
                 val colUnderClamped = (col + dxU).coerceIn(0, width - 1)
                 val colOverClamped = (col + dxO).coerceIn(0, width - 1)
 
-                // Extract luminance values [0..255]
                 val yU = yPlaneUnder[yOffsetUnder + colUnderClamped].toInt() and 0xFF
                 val yN = yPlaneNormal[yOffsetNormal + col].toInt() and 0xFF
                 val yO = yPlaneOver[yOffsetOver + colOverClamped].toInt() and 0xFF
 
-                // Lookup well-exposedness weights
                 var wU = WEIGHT_LUT[yU]
                 var wN = WEIGHT_LUT[yN]
                 var wO = WEIGHT_LUT[yO]
 
-                // Deep Fusion Sky & Highlight Recovery:
-                // Boost priority of under-exposed frame where normal image clips/blows out
                 if (yN > 170) {
-                    val highlightFactor = (yN - 170) / 85f // 0.0 .. 1.0
+                    val highlightFactor = (yN - 170) / 85f
                     wU += highlightFactor * 3.5f
                     wN *= (1f - highlightFactor * 0.7f)
                 }
 
-                // Deep Fusion Shadow & Face Lifting:
-                // Lift shadows on the face/foreground from over-exposed frame
                 if (yN < 90) {
-                    val shadowFactor = (90 - yN) / 90f // 0.0 .. 1.0
+                    val shadowFactor = (90 - yN) / 90f
                     wO += shadowFactor * 3.0f
                     wN *= (1f - shadowFactor * 0.5f)
                 }
 
                 val sumW = wU + wN + wO + 0.0001f
-
-                // Mathematically blend luminance with highlight detail preservation
                 val blendedY = ((wU * (yU * 1.1f) + wN * yN + wO * (yO * 0.95f)) / sumW).roundToInt().coerceIn(0, 255)
 
-                // Chroma sampling from normal baseline
                 val uvColOffset = (col shr 1)
                 val u = (uPlane[uvRowOffset + uvColOffset * uPixelStride].toInt() and 0xFF) - 128
                 val v = (vPlane[vRowOffset + uvColOffset * vPixelStride].toInt() and 0xFF) - 128
 
-                // YUV to sRGB conversion (ITU-R BT.601)
                 val r = (blendedY + (1.402f * v)).roundToInt().coerceIn(0, 255)
                 val g = (blendedY - (0.344136f * u) - (0.714136f * v)).roundToInt().coerceIn(0, 255)
                 val b = (blendedY + (1.772f * u)).roundToInt().coerceIn(0, 255)

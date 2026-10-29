@@ -582,9 +582,10 @@ class CameraEngine(
                         val buffer = image.planes[0].buffer
                         val bytes = ByteArray(buffer.remaining())
                         buffer.get(bytes)
+                        val isFront = currentLensFacing == CameraMetadata.LENS_FACING_FRONT
                         scope.launch {
                             try {
-                                val saved = photoStore.savePhoto(bytes)
+                                val saved = photoStore.savePhoto(bytes, isFrontCamera = isFront)
                                 listener.onPhotoSaved(saved)
                             } catch (e: Exception) {
                                 listener.onSessionError("Photo save error: ${e.message}")
@@ -635,12 +636,14 @@ class CameraEngine(
                             burstFrames.clear()
                             burstTimestampMap.clear()
                             val rot = pendingHdrRotation
+                            val isFront = currentLensFacing == CameraMetadata.LENS_FACING_FRONT
                             scope.launch(Dispatchers.Default) {
                                 try {
                                     val blended = ComputationalImageProcessor.blendHdrBurst(
                                         frames = framesToBlend,
                                         rotationDegrees = rot,
                                         mirrorHorizontal = false,
+                                        isFrontCamera = isFront,
                                     )
                                     val saved = photoStore.saveBitmap(blended, prefix = "MNC_HDR_")
                                     listener.onPhotoSaved(saved)
@@ -1613,20 +1616,40 @@ class CameraEngine(
             val normalComp = evCompensation.coerceIn(caps.aeCompMin, caps.aeCompMax)
             val overComp = (+2 * stepsPerEv).coerceIn(caps.aeCompMin, caps.aeCompMax)
 
+            val maxBurstExposureNs = ExposureStops.NANOS_PER_SECOND / 60L // 1/60s limit to eliminate motion blur & ghosting
             val underShutter = (currentShutterNs / 4L).coerceIn(caps.exposureMinNs, caps.exposureMaxNs)
             val normalShutter = currentShutterNs.coerceIn(caps.exposureMinNs, caps.exposureMaxNs)
-            val overShutter = (currentShutterNs * 4L).coerceIn(caps.exposureMinNs, caps.exposureMaxNs)
+            val rawOverShutter = currentShutterNs * 4L
+            val overShutter = rawOverShutter.coerceIn(caps.exposureMinNs, minOf(caps.exposureMaxNs, maxBurstExposureNs))
 
-            data class BracketSpec(val biasEv: Float, val aeComp: Int, val shutterNs: Long)
+            // In manual sensor mode, if overShutter is clamped to 1/60s, scale ISO proportionally to deliver full +2 EV exposure
+            val overIso = if (rawOverShutter > maxBurstExposureNs) {
+                val boost = (rawOverShutter.toFloat() / maxBurstExposureNs.toFloat())
+                (currentIso * boost).roundToInt().coerceIn(caps.isoMin, caps.isoMax)
+            } else {
+                currentIso.coerceIn(caps.isoMin, caps.isoMax)
+            }
+
+            data class BracketSpec(val biasEv: Float, val aeComp: Int, val shutterNs: Long, val iso: Int)
             val bracketList = listOf(
-                BracketSpec(biasEv = -2.0f, aeComp = underComp, shutterNs = underShutter),
-                BracketSpec(biasEv = 0.0f, aeComp = normalComp, shutterNs = normalShutter),
-                BracketSpec(biasEv = +2.0f, aeComp = overComp, shutterNs = overShutter),
+                BracketSpec(biasEv = -2.0f, aeComp = underComp, shutterNs = underShutter, iso = currentIso.coerceIn(caps.isoMin, caps.isoMax)),
+                BracketSpec(biasEv = 0.0f, aeComp = normalComp, shutterNs = normalShutter, iso = currentIso.coerceIn(caps.isoMin, caps.isoMax)),
+                BracketSpec(biasEv = +2.0f, aeComp = overComp, shutterNs = overShutter, iso = overIso),
             )
 
             val requests = bracketList.map { spec ->
-                val template = if (isRecording) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE
-                val builder = device.createCaptureRequest(template)
+                // Burst speed optimization: prioritize TEMPLATE_ZERO_SHUTTER_LAG or TEMPLATE_STILL_CAPTURE
+                val builder = try {
+                    if (isRecording) {
+                        device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
+                    } else {
+                        device.createCaptureRequest(CameraDevice.TEMPLATE_ZERO_SHUTTER_LAG)
+                    }
+                } catch (_: Exception) {
+                    val fallbackTemplate = if (isRecording) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE
+                    device.createCaptureRequest(fallbackTemplate)
+                }
+
                 builder.addTarget(yReader.surface)
                 previewSurface?.let { builder.addTarget(it) }
 
@@ -1635,7 +1658,7 @@ class CameraEngine(
 
                 if ((isManualExposure || caps.aeCompMin == caps.aeCompMax) && caps.manualSensor) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso.coerceIn(caps.isoMin, caps.isoMax))
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, spec.iso)
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, spec.shutterNs)
                 } else {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)

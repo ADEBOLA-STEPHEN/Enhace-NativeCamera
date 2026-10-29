@@ -24,6 +24,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -118,7 +119,11 @@ fun Viewfinder(
                 PreviewStandIn(Modifier.fillMaxSize())
             } else {
                 AndroidView(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = if (isFrontCamera) -1f else 1f
+                        },
                     factory = { ctx ->
                         TextureView(ctx).apply {
                             isOpaque = true
@@ -263,11 +268,6 @@ private fun applyTransform(
             matrix.postRotate(180f, centerX, centerY)
         }
         matrix.postScale(scaleX, scaleY, centerX, centerY)
-    }
-
-    if (isFrontCamera) {
-        // Un-mirror front camera preview so it displays true non-inverted orientation
-        matrix.postScale(-1f, 1f, centerX, centerY)
     }
 
     textureView.setTransform(matrix)

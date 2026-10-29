@@ -85,4 +85,7 @@ dependencies {
     // Coroutines - camera/IO work runs on dedicated dispatchers, never on Main
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
+
+    // OpenCV for Android (Median Threshold Bitmap alignment & Mertens HDR exposure fusion)
+    implementation("org.opencv:opencv:4.9.0")
 }

@@ -8,10 +8,13 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -31,7 +34,7 @@ class MediaStorePhotoStore(context: Context) {
         MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
 
     @Throws(IOException::class)
-    fun savePhoto(jpegBytes: ByteArray): SavedPhoto {
+    fun savePhoto(jpegBytes: ByteArray, isFrontCamera: Boolean = false): SavedPhoto {
         val stamp = LocalDateTime.now().format(STAMP_FORMAT)
         val displayName = "MNC_PHOTO_$stamp.jpg"
 
@@ -48,7 +51,21 @@ class MediaStorePhotoStore(context: Context) {
 
         try {
             resolver.openOutputStream(uri, "w")?.use { out ->
-                out.write(jpegBytes)
+                if (isFrontCamera) {
+                    val original = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                    if (original != null) {
+                        val flipMatrix = Matrix().apply { postScale(-1f, 1f) }
+                        val flipped = Bitmap.createBitmap(original, 0, 0, original.width, original.height, flipMatrix, true)
+                        val ok = flipped.compress(Bitmap.CompressFormat.JPEG, 100, out)
+                        if (!ok) throw IOException("Bitmap.compress returned false for $displayName")
+                        if (flipped != original) original.recycle()
+                        flipped.recycle()
+                    } else {
+                        out.write(jpegBytes)
+                    }
+                } else {
+                    out.write(jpegBytes)
+                }
                 out.flush()
             } ?: throw IOException("Cannot open output stream for $displayName")
 
