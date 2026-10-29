@@ -48,6 +48,7 @@ object VideoConfigSelector {
         profile: DeviceProfile? = null,
         safeBoundsEnabled: Boolean = true,
         customBitrateBps: Int? = null,
+        targetAspectRatio: Float? = null,
     ): VideoConfig {
         val safeWidth = if (safeBoundsEnabled && profile != null && profile.isClampedTo1080p && (targetWidth == null || targetWidth > profile.safeMaxVideoWidth)) {
             profile.safeMaxVideoWidth
@@ -70,10 +71,10 @@ object VideoConfigSelector {
             it.width <= MAX_WIDTH && (c.recorderMinFrameDurationsNs[it] ?: 0L) <= frameNs
         }
 
-        val nativeAspect = c.nativeSensorAspectRatio
-        // Align recorder surfaces with native sensor aspect ratio (usually 4:3) to prevent stretching/cropping
-        val nativeAspectSizes = sizes.filter { abs(it.width.toFloat() / it.height.toFloat() - nativeAspect) < 0.05f }
-        val pool = if (nativeAspectSizes.isNotEmpty()) nativeAspectSizes else sizes
+        val desiredAspect = targetAspectRatio ?: c.nativeSensorAspectRatio
+        // Align recorder surfaces with target aspect ratio to prevent stretching/cropping
+        val matchingAspectSizes = sizes.filter { abs(it.width.toFloat() / it.height.toFloat() - desiredAspect) < 0.05f }
+        val pool = if (matchingAspectSizes.isNotEmpty()) matchingAspectSizes else sizes
 
         val targetSizes = if (safeWidth != null) {
             pool.filter { it.width == safeWidth }.ifEmpty { pool }
@@ -164,11 +165,11 @@ object VideoConfigSelector {
     }
 
     /** Preview stream: same aspect as the recording (WYSIWYG framing), capped at 1080p for GPU cost. */
-    fun choosePreviewSize(c: CameraCapabilities, video: VideoConfig): Size {
-        val target = video.aspectRatio
+    fun choosePreviewSize(c: CameraCapabilities, video: VideoConfig, targetAspectRatio: Float? = null): Size {
+        val target = targetAspectRatio ?: video.aspectRatio
         val fitting = c.previewSizes.filter { it.width <= MAX_PREVIEW_W && it.height <= MAX_PREVIEW_H }
         return fitting
-            .filter { abs(it.width.toFloat() / it.height - target) < 0.01f }
+            .filter { abs(it.width.toFloat() / it.height - target) < 0.02f }
             .maxByOrNull { it.width.toLong() * it.height }
             ?: fitting.minByOrNull { abs(it.width.toFloat() / it.height - target) }
             ?: Size(MAX_PREVIEW_W, MAX_PREVIEW_H)

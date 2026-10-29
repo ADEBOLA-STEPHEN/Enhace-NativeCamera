@@ -30,6 +30,7 @@ import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import android.view.WindowManager
 import androidx.annotation.RequiresApi
 import com.mynativecamera.app.audio.AudioMeterData
 import com.mynativecamera.app.audio.AudioSourceType
@@ -144,6 +145,48 @@ class CameraEngine(
     private var deviceProfile: DeviceProfile? = null
     private var previewSize: Size? = null
 
+    val currentCapabilities: CameraCapabilities? get() = capabilities
+    val currentVideoConfig: VideoConfig? get() = videoConfig
+
+    var currentTargetAspectRatio: Float = 4f / 3f
+        private set
+
+    fun setTargetAspectRatio(aspectRatio: Float) {
+        if (kotlin.math.abs(currentTargetAspectRatio - aspectRatio) > 0.02f) {
+            currentTargetAspectRatio = aspectRatio
+            rebuildSession()
+        }
+    }
+
+    fun getSurfaceRotation(): Int {
+        return try {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                wm?.defaultDisplay?.rotation
+                    ?: (context as? android.app.Activity)?.display?.rotation
+                    ?: Surface.ROTATION_0
+            } else {
+                @Suppress("DEPRECATION")
+                wm?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+            }
+        } catch (_: Exception) {
+            Surface.ROTATION_0
+        }
+    }
+
+    fun computeJpegOrientation(displayRotationDegreesOverride: Int? = null): Int {
+        val caps = capabilities ?: return 0
+        val surfaceRotation = getSurfaceRotation()
+        val deviceRotationDegrees = displayRotationDegreesOverride ?: (surfaceRotation * 90)
+        val sensorOrientation = caps.sensorOrientation
+        val isFront = caps.isFrontFacing
+        return if (isFront) {
+            (sensorOrientation + deviceRotationDegrees) % 360
+        } else {
+            (sensorOrientation - deviceRotationDegrees + 360) % 360
+        }
+    }
+
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
 
@@ -177,9 +220,44 @@ class CameraEngine(
     private var activeLens: LensOption = LensOption.Wide
     private var safeBoundsEnabled: Boolean = true
 
-    // Face Priority Metering state
-    private var detectedFaceRegion: MeteringRectangle? = null
-    private var lastFaceUpdateTimeMs: Long = 0L
+    // Equilibrium Metering state (Dynamic Auto-Exposure / Auto-Focus)
+    private var currentEquilibriumRegion: MeteringRectangle? = null
+    private var lastEquilibriumUpdateTimeMs: Long = 0L
+    private var isFaceActiveInEquilibrium: Boolean = false
+
+    /**
+     * Equilibrium Metering: Computes the metering rectangle based on detected face
+     * (sensor coordinates, weight 1000) or fallback to center 30% of active array (weight 800).
+     */
+    private fun computeEquilibriumMeteringRectangle(
+        activeArray: Rect,
+        primaryFace: Face?,
+    ): MeteringRectangle {
+        if (primaryFace != null) {
+            val b = primaryFace.bounds
+            val left = b.left.coerceIn(activeArray.left, activeArray.right)
+            val top = b.top.coerceIn(activeArray.top, activeArray.bottom)
+            val right = b.right.coerceIn(activeArray.left, activeArray.right)
+            val bottom = b.bottom.coerceIn(activeArray.top, activeArray.bottom)
+            val faceWidth = (right - left).coerceAtLeast(1)
+            val faceHeight = (bottom - top).coerceAtLeast(1)
+            val faceRect = Rect(left, top, left + faceWidth, top + faceHeight)
+            return MeteringRectangle(faceRect, 1000)
+        }
+
+        // Center-weighted: Middle 30% of sensor active array, weight 800
+        val w = activeArray.width()
+        val h = activeArray.height()
+        val cx = activeArray.centerX()
+        val cy = activeArray.centerY()
+        val boxW = (w * 0.30f).roundToInt().coerceIn(1, w)
+        val boxH = (h * 0.30f).roundToInt().coerceIn(1, h)
+        val left = (cx - boxW / 2).coerceIn(activeArray.left, (activeArray.right - boxW).coerceAtLeast(activeArray.left))
+        val top = (cy - boxH / 2).coerceIn(activeArray.top, (activeArray.bottom - boxH).coerceAtLeast(activeArray.top))
+        val centerRect = Rect(left, top, left + boxW, top + boxH)
+        return MeteringRectangle(centerRect, 800)
+    }
+
 
     // Video settings
     private var targetVideoWidth: Int? = null
@@ -311,10 +389,11 @@ class CameraEngine(
                     profile = profile,
                     safeBoundsEnabled = safeBoundsEnabled,
                     customBitrateBps = customBitrateMbps * 1_000_000,
+                    targetAspectRatio = currentTargetAspectRatio,
                 )
                 videoConfig = vConfig
 
-                val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig)
+                val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig, currentTargetAspectRatio)
                 previewSize = pSize
                 texture.setDefaultBufferSize(pSize.width, pSize.height)
                 previewSurface?.release()
@@ -363,10 +442,11 @@ class CameraEngine(
                     profile = profile,
                     safeBoundsEnabled = safeBoundsEnabled,
                     customBitrateBps = customBitrateMbps * 1_000_000,
+                    targetAspectRatio = currentTargetAspectRatio,
                 )
                 videoConfig = vConfig
 
-                val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig)
+                val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig, currentTargetAspectRatio)
                 previewSize = pSize
 
                 surfaceTexture.setDefaultBufferSize(pSize.width, pSize.height)
@@ -440,6 +520,9 @@ class CameraEngine(
             Log.w(TAG, "Error closing camera device", e)
         }
         cameraDevice = null
+        currentEquilibriumRegion = null
+        lastEquilibriumUpdateTimeMs = 0L
+        isFaceActiveInEquilibrium = false
     }
 
     // ---- Capture Session Lifecycle ----------------------------------------------------------
@@ -480,11 +563,13 @@ class CameraEngine(
                     s
                 }
 
-                // Setup ImageReader for full-res still photos (JPEG) matching native sensor aspect ratio (4:3)
-                val targetAspect = caps.nativeSensorAspectRatio
-                val photoSize = caps.photoSizes
-                    .filter { kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspect) < 0.05f }
-                    .maxByOrNull { it.width.toLong() * it.height.toLong() }
+                // Setup ImageReader for full-res still photos (JPEG) strictly matching Viewfinder aspect ratio
+                val targetAspect = currentTargetAspectRatio
+                val photoCandidates = caps.photoSizes.filter {
+                    kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspect) < 0.05f
+                }
+                val photoSize = photoCandidates.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    ?: caps.photoSizes.minByOrNull { kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspect) }
                     ?: caps.photoSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
                     ?: Size(4000, 3000)
                 val reader = ImageReader.newInstance(photoSize.width, photoSize.height, ImageFormat.JPEG, 2)
@@ -510,19 +595,20 @@ class CameraEngine(
                     }
                 }, handler)
 
-                // Setup ImageReader for Computational HDR Burst Photos matching native sensor aspect ratio (4:3)
+                // Setup ImageReader for Computational HDR Burst Photos strictly matching Viewfinder aspect ratio
                 val yuvCandidates = caps.yuvSizes.filter {
                     kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspect) < 0.05f
                 }
+                val yuvPool = if (yuvCandidates.isNotEmpty()) yuvCandidates else caps.yuvSizes
                 val yuvSize = if (safeBoundsEnabled && (deviceProfile?.tier != DeviceTier.ProFlagship)) {
-                    yuvCandidates.firstOrNull { it.width <= 2560 && it.height <= 1920 }
-                        ?: yuvCandidates.firstOrNull { it.width <= 2048 }
-                        ?: yuvCandidates.firstOrNull { it.width <= 1920 }
-                        ?: caps.yuvSizes.firstOrNull()
+                    yuvPool.firstOrNull { it.width <= 2560 && it.height <= 1920 }
+                        ?: yuvPool.firstOrNull { it.width <= 2048 }
+                        ?: yuvPool.firstOrNull { it.width <= 1920 }
+                        ?: yuvPool.firstOrNull()
                         ?: Size(1920, 1440)
                 } else {
-                    yuvCandidates.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                        ?: caps.yuvSizes.firstOrNull()
+                    yuvPool.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                        ?: yuvPool.firstOrNull()
                         ?: Size(1920, 1440)
                 }
                 val yReader = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 5)
@@ -549,13 +635,12 @@ class CameraEngine(
                             burstFrames.clear()
                             burstTimestampMap.clear()
                             val rot = pendingHdrRotation
-                            val mirror = caps.isFrontFacing
                             scope.launch(Dispatchers.Default) {
                                 try {
                                     val blended = ComputationalImageProcessor.blendHdrBurst(
                                         frames = framesToBlend,
                                         rotationDegrees = rot,
-                                        mirrorHorizontal = mirror,
+                                        mirrorHorizontal = false,
                                     )
                                     val saved = photoStore.saveBitmap(blended, prefix = "MNC_HDR_")
                                     listener.onPhotoSaved(saved)
@@ -777,43 +862,41 @@ class CameraEngine(
                 }
             }
 
-            // Face Priority Metering: inspect detected faces from ISP
-            val faces = result.get(CaptureResult.STATISTICS_FACES)
-            val primaryFace = faces?.filter { it.score >= 30 }?.maxByOrNull { it.bounds.width() * it.bounds.height() }
-            val nowMs = android.os.SystemClock.elapsedRealtime()
-            if (focusAeRegions == null && nowMs - lastFaceUpdateTimeMs > 250L) {
-                val caps = capabilities
-                val newFaceRect = if (primaryFace != null && caps != null) {
-                    val activeArray = caps.activeArraySize
-                    val b = primaryFace.bounds
-                    val rect = if (activeArray != null) {
-                        Rect(
-                            b.left.coerceIn(activeArray.left, activeArray.right),
-                            b.top.coerceIn(activeArray.top, activeArray.bottom),
-                            b.right.coerceIn(activeArray.left, activeArray.right),
-                            b.bottom.coerceIn(activeArray.top, activeArray.bottom),
-                        )
-                    } else b
-                    MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
-                } else null
+            // Dynamic Equilibrium Metering: continuous monitoring loop
+            val caps = capabilities
+            if (focusAeRegions == null && caps != null) {
+                val activeArray = caps.activeArraySize ?: characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (activeArray != null) {
+                    val faces = result.get(CaptureResult.STATISTICS_FACES)
+                    val primaryFace = faces?.filter { it.score >= 15 && it.bounds.width() > 0 && it.bounds.height() > 0 }
+                        ?.maxByOrNull { it.bounds.width() * it.bounds.height() }
 
-                val shouldUpdate = when {
-                    detectedFaceRegion == null && newFaceRect != null -> true
-                    detectedFaceRegion != null && newFaceRect == null -> true
-                    detectedFaceRegion != null && newFaceRect != null -> {
-                        val c1x = detectedFaceRegion!!.rect.centerX()
-                        val c1y = detectedFaceRegion!!.rect.centerY()
-                        val c2x = newFaceRect.rect.centerX()
-                        val c2y = newFaceRect.rect.centerY()
-                        kotlin.math.abs(c1x - c2x) > 60 || kotlin.math.abs(c1y - c2y) > 60
+                    val hasFace = primaryFace != null
+                    val candidate = computeEquilibriumMeteringRectangle(activeArray, primaryFace)
+                    val nowMs = android.os.SystemClock.elapsedRealtime()
+
+                    val shouldUpdate = when {
+                        currentEquilibriumRegion == null -> true
+                        isFaceActiveInEquilibrium != hasFace -> (nowMs - lastEquilibriumUpdateTimeMs > 200L)
+                        hasFace -> {
+                            // Face tracking hysteresis: update only if moved significantly (> 4% of sensor) and throttled
+                            val prev = currentEquilibriumRegion!!.rect
+                            val curr = candidate.rect
+                            val dx = kotlin.math.abs(prev.centerX() - curr.centerX())
+                            val dy = kotlin.math.abs(prev.centerY() - curr.centerY())
+                            val thresholdX = (activeArray.width() * 0.04f).toInt()
+                            val thresholdY = (activeArray.height() * 0.04f).toInt()
+                            (dx > thresholdX || dy > thresholdY) && (nowMs - lastEquilibriumUpdateTimeMs > 250L)
+                        }
+                        else -> false
                     }
-                    else -> false
-                }
 
-                if (shouldUpdate) {
-                    lastFaceUpdateTimeMs = nowMs
-                    detectedFaceRegion = newFaceRect
-                    updateRepeatingRequest()
+                    if (shouldUpdate) {
+                        lastEquilibriumUpdateTimeMs = nowMs
+                        currentEquilibriumRegion = candidate
+                        isFaceActiveInEquilibrium = hasFace
+                        updateRepeatingRequest()
+                    }
                 }
             }
         }
@@ -852,11 +935,38 @@ class CameraEngine(
     }
 
     private fun setupInitialMetering(builder: CaptureRequest.Builder) {
+        val caps = capabilities
         builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+
+        // Enable Hardware Face Detection
+        val faceDetectMode = if (caps != null && caps.bestFaceDetectMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
+            caps.bestFaceDetectMode
+        } else {
+            CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
+        }
+        try {
+            builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceDetectMode)
+        } catch (_: Exception) {}
+
+        // Equilibrium initial center metering (Middle 30%, weight 800)
+        if (caps != null) {
+            val activeArray = caps.activeArraySize ?: characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            if (activeArray != null) {
+                val equilibrium = currentEquilibriumRegion ?: computeEquilibriumMeteringRectangle(activeArray, null).also {
+                    currentEquilibriumRegion = it
+                }
+                if (caps.maxRegionsAe > 0) {
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(equilibrium))
+                }
+                if (caps.maxRegionsAf > 0) {
+                    builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(equilibrium))
+                }
+            }
+        }
     }
 
     private fun processInitialConvergence(result: TotalCaptureResult) {
@@ -934,21 +1044,30 @@ class CameraEngine(
             }
         }
 
-        // Tap-to-Focus and Metering Regions (with Face Priority Metering fallback)
-        val faceRegion = detectedFaceRegion
-        val afRegs = focusAfRegions ?: if (faceRegion != null && caps.maxRegionsAf > 0) arrayOf(faceRegion) else null
+        // Tap-to-Focus and Metering Regions (with Dynamic Equilibrium Metering fallback)
+        val activeArray = caps.activeArraySize ?: characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val equilibrium = currentEquilibriumRegion ?: if (activeArray != null) {
+            computeEquilibriumMeteringRectangle(activeArray, null).also { currentEquilibriumRegion = it }
+        } else null
+
+        val afRegs = focusAfRegions ?: if (equilibrium != null && caps.maxRegionsAf > 0) arrayOf(equilibrium) else null
         if (afRegs != null && caps.maxRegionsAf > 0) {
             builder.set(CaptureRequest.CONTROL_AF_REGIONS, afRegs)
         }
-        val aeRegs = focusAeRegions ?: if (faceRegion != null && caps.maxRegionsAe > 0) arrayOf(faceRegion) else null
+        val aeRegs = focusAeRegions ?: if (equilibrium != null && caps.maxRegionsAe > 0) arrayOf(equilibrium) else null
         if (aeRegs != null && caps.maxRegionsAe > 0) {
             builder.set(CaptureRequest.CONTROL_AE_REGIONS, aeRegs)
         }
 
-        // Face Detection for Pixel-like Face Priority Metering
-        if (caps.bestFaceDetectMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
-            builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, caps.bestFaceDetectMode)
+        // Enable Hardware Face Detection for Pixel-like Face Priority Metering
+        val faceDetectMode = if (caps.bestFaceDetectMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
+            caps.bestFaceDetectMode
+        } else {
+            CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
         }
+        try {
+            builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceDetectMode)
+        } catch (_: Exception) {}
 
         // White Balance: Manual Kelvin vs Auto / Lock
         if (wbMode == WbMode.Manual) {
@@ -1154,7 +1273,16 @@ class CameraEngine(
 
     fun setAutoExposure() {
         isManualExposure = false
+        focusAeRegions = null
+        focusAfRegions = null
         cameraHandler?.post { updateRepeatingRequest() }
+    }
+
+    fun resetFocusAndMetering() {
+        focusAeRegions = null
+        focusAfRegions = null
+        currentEquilibriumRegion = null
+        updateRepeatingRequest()
     }
 
     fun isAutoExposure(): Boolean = !isManualExposure
@@ -1266,6 +1394,11 @@ class CameraEngine(
 
         val handler = cameraHandler ?: return
         handler.post {
+            focusAfRegions = null
+            focusAeRegions = null
+            currentEquilibriumRegion = null
+            lastEquilibriumUpdateTimeMs = 0L
+            isFaceActiveInEquilibrium = false
             closeSession()
             closeCamera()
             val surface = previewSurfaceTexture ?: return@post
@@ -1288,9 +1421,10 @@ class CameraEngine(
                 profile = profile,
                 safeBoundsEnabled = safeBoundsEnabled,
                 customBitrateBps = customBitrateMbps * 1_000_000,
+                targetAspectRatio = currentTargetAspectRatio,
             )
             videoConfig = vConfig
-            val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig)
+            val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig, currentTargetAspectRatio)
             previewSize = pSize
             surface.setDefaultBufferSize(pSize.width, pSize.height)
 
@@ -1334,9 +1468,10 @@ class CameraEngine(
                 profile = profile,
                 safeBoundsEnabled = safeBoundsEnabled,
                 customBitrateBps = customBitrateMbps * 1_000_000,
+                targetAspectRatio = currentTargetAspectRatio,
             )
             videoConfig = vConfig
-            val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig)
+            val pSize = VideoConfigSelector.choosePreviewSize(caps, vConfig, currentTargetAspectRatio)
             previewSize = pSize
             previewSurfaceTexture?.setDefaultBufferSize(pSize.width, pSize.height)
 
@@ -1401,17 +1536,8 @@ class CameraEngine(
                 builder.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_HIGH_QUALITY)
             }
 
-            // Calculate rotation for JPEG output based on physical device orientation & sensor orientation
-            val deviceRot = if (orientationListener.canDetectOrientation()) {
-                orientationListener.currentRotationDegrees
-            } else {
-                displayRotationDegrees
-            }
-            val jpegRotation = DeviceOrientationListener.computeOrientationHint(
-                sensorOrientation = caps.sensorOrientation,
-                deviceRotationDegrees = deviceRot,
-                isFrontFacing = caps.isFrontFacing,
-            )
+            // Calculate rotation for JPEG output based on Surface rotation & sensor orientation
+            val jpegRotation = computeJpegOrientation(displayRotationDegrees)
             builder.set(CaptureRequest.JPEG_ORIENTATION, jpegRotation)
             builder.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
 
@@ -1478,16 +1604,8 @@ class CameraEngine(
         burstFrames.clear()
         burstTimestampMap.clear()
 
-        val deviceRot = if (orientationListener.canDetectOrientation()) {
-            orientationListener.currentRotationDegrees
-        } else {
-            displayRotationDegrees
-        }
-        pendingHdrRotation = DeviceOrientationListener.computeOrientationHint(
-            sensorOrientation = caps.sensorOrientation,
-            deviceRotationDegrees = deviceRot,
-            isFrontFacing = caps.isFrontFacing,
-        )
+        val jpegRotation = computeJpegOrientation(displayRotationDegrees)
+        pendingHdrRotation = jpegRotation
 
         try {
             val stepsPerEv = if (caps.aeCompStep > 0f) (1f / caps.aeCompStep).roundToInt() else 3
@@ -1513,6 +1631,7 @@ class CameraEngine(
                 previewSurface?.let { builder.addTarget(it) }
 
                 applyProControls(builder)
+                builder.set(CaptureRequest.JPEG_ORIENTATION, jpegRotation)
 
                 if ((isManualExposure || caps.aeCompMin == caps.aeCompMax) && caps.manualSensor) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1608,16 +1727,7 @@ class CameraEngine(
         isRecording = true
         scope.launch {
             try {
-                val deviceRot = if (orientationListener.canDetectOrientation()) {
-                    orientationListener.currentRotationDegrees
-                } else {
-                    displayRotationDegrees
-                }
-                val orientationHint = DeviceOrientationListener.computeOrientationHint(
-                    sensorOrientation = caps.sensorOrientation,
-                    deviceRotationDegrees = deviceRot,
-                    isFrontFacing = caps.isFrontFacing,
-                )
+                val orientationHint = computeJpegOrientation(displayRotationDegrees)
 
                 audioEngine.pauseForRecording()
                 val preferredMic = audioEngine.getPreferredAudioDeviceInfo()

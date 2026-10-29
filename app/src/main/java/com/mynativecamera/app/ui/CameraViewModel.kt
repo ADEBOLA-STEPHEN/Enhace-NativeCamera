@@ -279,7 +279,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onCaptureModeChanged(mode: CaptureMode) {
         haptics.click()
-        _uiState.update { it.copy(captureMode = mode, activeModal = SliderModal.None) }
+        val caps = engine.currentCapabilities
+        val targetAspect = when (mode) {
+            CaptureMode.Photo -> caps?.nativeSensorAspectRatio ?: (4f / 3f)
+            CaptureMode.Video -> {
+                val spec = _uiState.value.videoSpec
+                if (spec.height > 0) spec.width.toFloat() / spec.height.toFloat() else (16f / 9f)
+            }
+        }
+        _uiState.update { it.copy(captureMode = mode, activeModal = SliderModal.None, previewAspectRatio = targetAspect) }
+        engine.setTargetAspectRatio(targetAspect)
     }
 
     fun onActiveModalToggled(modal: SliderModal) {

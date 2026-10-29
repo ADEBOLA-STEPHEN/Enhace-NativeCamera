@@ -75,6 +75,27 @@ fun Viewfinder(
         label = "tallyAlpha",
     )
 
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val rotation = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.display?.rotation ?: Surface.ROTATION_0
+        } else {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            @Suppress("DEPRECATION")
+            wm?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        }
+    } catch (_: Exception) {
+        Surface.ROTATION_0
+    }
+
+    val isLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+    val rawAspect = if (aspectRatio > 0f) aspectRatio else (4f / 3f)
+    val targetAspect = if (isLandscape) {
+        if (rawAspect > 1f) rawAspect else 1f / rawAspect
+    } else {
+        if (rawAspect > 1f) 1f / rawAspect else rawAspect
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -83,7 +104,7 @@ fun Viewfinder(
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
+                .aspectRatio(targetAspect)
                 .clipToBounds()
                 .testTag("viewfinder")
                 .pointerInput(Unit) {
@@ -98,8 +119,8 @@ fun Viewfinder(
             } else {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
-                    factory = { context ->
-                        TextureView(context).apply {
+                    factory = { ctx ->
+                        TextureView(ctx).apply {
                             isOpaque = true
                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                                 override fun onSurfaceTextureAvailable(
@@ -219,14 +240,15 @@ private fun applyTransform(
     val viewAspect = viewWidth.toFloat() / viewHeight.toFloat()
     val scaleX: Float
     val scaleY: Float
-    if (viewAspect < bufferAspect) {
-        // Screen is taller than buffer: expand width so height covers cleanly (center-crop)
-        scaleX = bufferAspect / viewAspect
+    if (kotlin.math.abs(viewAspect - bufferAspect) < 0.02f) {
+        scaleX = 1f
         scaleY = 1f
-    } else {
-        // Screen is wider than buffer: expand height so width covers cleanly (center-crop)
+    } else if (viewAspect < bufferAspect) {
         scaleX = 1f
         scaleY = viewAspect / bufferAspect
+    } else {
+        scaleX = bufferAspect / viewAspect
+        scaleY = 1f
     }
 
     if (isLandscape) {
@@ -244,10 +266,9 @@ private fun applyTransform(
     }
 
     if (isFrontCamera) {
-        // Natural mirror flip for selfie/front camera view
+        // Un-mirror front camera preview so it displays true non-inverted orientation
         matrix.postScale(-1f, 1f, centerX, centerY)
     }
 
-    // Apply the center-crop scale and rotation transform matrix to the TextureView
     textureView.setTransform(matrix)
 }
